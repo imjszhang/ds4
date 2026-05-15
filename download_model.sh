@@ -59,6 +59,9 @@ Options:
 Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
+  DS4_HF_BASE    Base URL for Hugging Face file downloads (no trailing slash).
+                 Default: https://huggingface.co
+                 Example (China mirror): https://hf-mirror.com
 
 After q2-imatrix/q4-imatrix/q2/q4 downloads the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
@@ -120,12 +123,17 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
     TOKEN=$(cat "$HOME/.cache/huggingface/token")
 fi
 
+HF_BASE=${DS4_HF_BASE:-https://huggingface.co}
+case "$HF_BASE" in
+    */) HF_BASE=${HF_BASE%/} ;;
+esac
+
 download_one() {
     file=$1
     out="$OUT_DIR/$file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="$HF_BASE/$REPO/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -141,7 +149,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from $HF_BASE/$REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
