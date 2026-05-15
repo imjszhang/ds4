@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mac Studio 512GB + q4-imatrix 推荐启动（Metal，本机监听）。
-#   端口 8005；上下文默认 1M（模型标称上限）；失败时可降 DS4_CTX。
+#   端口 8005；上下文默认 1M（模型标称上限）；双 worker；失败时可降 DS4_CTX/DS4_WORKERS。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,6 +10,7 @@ cd "$ROOT"
 : "${DS4_PORT:=8005}"
 : "${DS4_CTX:=1048576}"
 : "${DS4_DEFAULT_TOKENS:=393216}"
+: "${DS4_WORKERS:=2}"
 : "${DS4_KV_DISK_DIR:=$HOME/Library/Caches/ds4-server-kv}"
 : "${DS4_KV_DISK_SPACE_MB:=98304}"
 LOGICAL_CPUS="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 16)"
@@ -30,6 +31,7 @@ exec ./ds4-server \
   --ctx "$DS4_CTX" \
   --tokens "$DS4_DEFAULT_TOKENS" \
   --threads "$THREADS" \
+  --workers "$DS4_WORKERS" \
   --warm-weights \
   --kv-disk-dir "$DS4_KV_DISK_DIR" \
   --kv-disk-space-mb "$DS4_KV_DISK_SPACE_MB" \

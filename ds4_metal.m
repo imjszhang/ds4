@@ -9,6 +9,7 @@
 #include <float.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/sysctl.h>
 
 #include "ds4.h"
@@ -37,6 +38,9 @@ static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
+static pthread_mutex_t g_execution_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_execution_owner;
+static bool g_execution_owner_valid;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
@@ -267,6 +271,21 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
         return 0;
     }
     return 1;
+}
+
+void ds4_gpu_execution_lock(void) {
+    pthread_mutex_lock(&g_execution_mutex);
+    g_execution_owner = pthread_self();
+    g_execution_owner_valid = true;
+}
+
+void ds4_gpu_execution_unlock(void) {
+    g_execution_owner_valid = false;
+    pthread_mutex_unlock(&g_execution_mutex);
+}
+
+static bool ds4_gpu_execution_is_owner(void) {
+    return g_execution_owner_valid && pthread_equal(g_execution_owner, pthread_self());
 }
 
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
@@ -3912,9 +3931,17 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_batch_cb) return 0;
+    ds4_gpu_execution_lock();
+    if (g_batch_cb) {
+        ds4_gpu_execution_unlock();
+        return 0;
+    }
     g_batch_cb = [g_queue commandBuffer];
-    return g_batch_cb != nil;
+    if (!g_batch_cb) {
+        ds4_gpu_execution_unlock();
+        return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_flush_commands(void) {
@@ -3931,6 +3958,7 @@ int ds4_gpu_flush_commands(void) {
     if (!g_batch_cb) {
         (void)ds4_gpu_wait_pending_command_buffers("command batch");
         [g_transient_buffers removeAllObjects];
+        ds4_gpu_execution_unlock();
         return 0;
     }
     return 1;
@@ -3941,21 +3969,30 @@ int ds4_gpu_end_commands(void) {
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    ds4_gpu_execution_unlock();
+    return ok;
 }
 
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_batch_cb) return ds4_gpu_end_commands();
+    if (g_batch_cb && ds4_gpu_execution_is_owner()) return ds4_gpu_end_commands();
+    ds4_gpu_execution_lock();
     if ([g_pending_cbs count] != 0) {
         int ok = ds4_gpu_wait_pending_command_buffers("synchronize");
         [g_transient_buffers removeAllObjects];
+        ds4_gpu_execution_unlock();
         return ok;
     }
 
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    if (!cb) return 0;
-    return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
+    if (!cb) {
+        ds4_gpu_execution_unlock();
+        return 0;
+    }
+    int ok = ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
+    ds4_gpu_execution_unlock();
+    return ok;
 }
 
 void ds4_gpu_cleanup(void) {

@@ -501,6 +501,7 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 }
 
 typedef struct server server;
+typedef struct server_group server_group;
 
 typedef struct {
     char *id;
@@ -7461,6 +7462,9 @@ static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
+    server_group *group;
+    int worker_id;
+    bool initialized;
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
@@ -7473,12 +7477,28 @@ struct server {
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    pthread_cond_t clients_cv;
     job *head;
     job *tail;
     bool stopping;
-    int clients;
+    int queued;
+    bool running;
     uint64_t seq;
+    FILE *trace;
+    pthread_mutex_t trace_mu;
+    uint64_t trace_seq;
+};
+
+struct server_group {
+    ds4_engine *engine;
+    server *slot;
+    pthread_t *worker;
+    int workers;
+    int default_tokens;
+    int ctx_size;
+    bool stopping;
+    int clients;
+    pthread_mutex_t mu;
+    pthread_cond_t clients_cv;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -9544,6 +9564,18 @@ static void trace_time(FILE *fp) {
     fputs(buf, fp);
 }
 
+static FILE *server_trace_file(server *s) {
+    return s && s->group ? s->group->trace : (s ? s->trace : NULL);
+}
+
+static pthread_mutex_t *server_trace_mutex(server *s) {
+    return s && s->group ? &s->group->trace_mu : (s ? &s->trace_mu : NULL);
+}
+
+static uint64_t *server_trace_sequence(server *s) {
+    return s && s->group ? &s->group->trace_seq : (s ? &s->trace_seq : NULL);
+}
+
 static uint64_t trace_begin(
         server *s,
         const job *j,
@@ -9553,13 +9585,16 @@ static uint64_t trace_begin(
         const char *cache_source,
         int disk_cached,
         const char *disk_path) {
-    if (!s->trace) return 0;
+    FILE *trace = server_trace_file(s);
+    pthread_mutex_t *trace_mu = server_trace_mutex(s);
+    uint64_t *trace_seq = server_trace_sequence(s);
+    if (!trace || !trace_mu || !trace_seq) return 0;
 
-    pthread_mutex_lock(&s->trace_mu);
-    uint64_t id = ++s->trace_seq;
-    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
-    trace_time(s->trace);
-    fprintf(s->trace,
+    pthread_mutex_lock(trace_mu);
+    uint64_t id = ++(*trace_seq);
+    fprintf(trace, "\n===== request %llu worker=%d ", (unsigned long long)id, s->worker_id);
+    trace_time(trace);
+    fprintf(trace,
             " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
@@ -9575,49 +9610,53 @@ static uint64_t trace_begin(
             j->req.top_p,
             j->req.min_p,
             (unsigned long long)j->req.seed);
-    fprintf(s->trace, "stream_include_usage: %d\n",
+    fprintf(trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
     trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
                            cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
-        fputs("\n--- raw request json ---\n", s->trace);
-        fputs(j->req.raw_body, s->trace);
+        fputs("\n--- raw request json ---\n", trace);
+        fputs(j->req.raw_body, trace);
         if (!j->req.raw_body[0] || j->req.raw_body[strlen(j->req.raw_body) - 1] != '\n') {
-            fputc('\n', s->trace);
+            fputc('\n', trace);
         }
     }
     if (j->req.prompt_text) {
-        fputs("\n--- rendered prompt ---\n", s->trace);
-        fputs(j->req.prompt_text, s->trace);
+        fputs("\n--- rendered prompt ---\n", trace);
+        fputs(j->req.prompt_text, trace);
         if (!j->req.prompt_text[0] || j->req.prompt_text[strlen(j->req.prompt_text) - 1] != '\n') {
-            fputc('\n', s->trace);
+            fputc('\n', trace);
         }
     }
-    fputs("\n--- generated text ---\n", s->trace);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    fputs("\n--- generated text ---\n", trace);
+    fflush(trace);
+    pthread_mutex_unlock(trace_mu);
     return id;
 }
 
 static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
-    if (!s->trace || !id || !piece || !len) return;
-    pthread_mutex_lock(&s->trace_mu);
-    fwrite(piece, 1, len, s->trace);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    FILE *trace = server_trace_file(s);
+    pthread_mutex_t *trace_mu = server_trace_mutex(s);
+    if (!trace || !trace_mu || !id || !piece || !len) return;
+    pthread_mutex_lock(trace_mu);
+    fwrite(piece, 1, len, trace);
+    fflush(trace);
+    pthread_mutex_unlock(trace_mu);
 }
 
 static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
-    if (!s->trace || !id) return;
-    pthread_mutex_lock(&s->trace_mu);
-    fputs("\n\n--- trace: ", s->trace);
+    FILE *trace = server_trace_file(s);
+    pthread_mutex_t *trace_mu = server_trace_mutex(s);
+    if (!trace || !trace_mu || !id) return;
+    pthread_mutex_lock(trace_mu);
+    fputs("\n\n--- trace: ", trace);
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(s->trace, fmt, ap);
+    vfprintf(trace, fmt, ap);
     va_end(ap);
-    fputs(" ---\n\n", s->trace);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    fputs(" ---\n\n", trace);
+    fflush(trace);
+    pthread_mutex_unlock(trace_mu);
 }
 
 static void trace_finish(
@@ -9632,10 +9671,12 @@ static void trace_finish(
         const char *parsed_reasoning,
         const tool_calls *parsed_calls,
         double elapsed) {
-    if (!s->trace || !id) return;
+    FILE *trace = server_trace_file(s);
+    pthread_mutex_t *trace_mu = server_trace_mutex(s);
+    if (!trace || !trace_mu || !id) return;
 
-    pthread_mutex_lock(&s->trace_mu);
-    fprintf(s->trace,
+    pthread_mutex_lock(trace_mu);
+    fprintf(trace,
             "\n\n--- parsed message ---\nfinish: %s\ngenerated_tokens: %d\ndsml_start: %d\ndsml_end: %d\nelapsed_sec: %.3f\n",
             final_finish,
             completion,
@@ -9644,27 +9685,27 @@ static void trace_finish(
             elapsed);
     if (r->kind == REQ_CHAT) {
         if (parsed_reasoning && parsed_reasoning[0]) {
-            fputs("\nreasoning:\n", s->trace);
-            fputs(parsed_reasoning, s->trace);
-            fputc('\n', s->trace);
+            fputs("\nreasoning:\n", trace);
+            fputs(parsed_reasoning, trace);
+            fputc('\n', trace);
         }
         if (parsed_content && parsed_content[0]) {
-            fputs("\ncontent:\n", s->trace);
-            fputs(parsed_content, s->trace);
-            fputc('\n', s->trace);
+            fputs("\ncontent:\n", trace);
+            fputs(parsed_content, trace);
+            fputc('\n', trace);
         }
         for (int i = 0; i < parsed_calls->len; i++) {
             const tool_call *tc = &parsed_calls->v[i];
-            fprintf(s->trace, "\ntool_call[%d]:\nid: %s\nname: %s\narguments:\n%s\n",
+            fprintf(trace, "\ntool_call[%d]:\nid: %s\nname: %s\narguments:\n%s\n",
                     i,
                     tc->id ? tc->id : "",
                     tc->name ? tc->name : "",
                     tc->arguments ? tc->arguments : "");
         }
     }
-    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    fprintf(trace, "\n===== end request %llu =====\n", (unsigned long long)id);
+    fflush(trace);
+    pthread_mutex_unlock(trace_mu);
 }
 
 typedef struct {
@@ -10916,6 +10957,7 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    s->queued++;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
     return true;
@@ -10931,9 +10973,17 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    if (s->queued > 0) s->queued--;
+    s->running = true;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
+}
+
+static void worker_note_done(server *s) {
+    pthread_mutex_lock(&s->mu);
+    s->running = false;
+    pthread_mutex_unlock(&s->mu);
 }
 
 static void *worker_main(void *arg) {
@@ -10942,6 +10992,7 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, j);
+        worker_note_done(s);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11038,9 +11089,31 @@ fail:
 }
 
 typedef struct {
-    server *srv;
+    server_group *group;
     int fd;
 } client_arg;
+
+static int server_slot_load(server *s) {
+    int load;
+    pthread_mutex_lock(&s->mu);
+    load = s->queued + (s->running ? 1 : 0);
+    pthread_mutex_unlock(&s->mu);
+    return load;
+}
+
+static server *choose_worker_slot(server_group *g) {
+    if (!g || !g->slot || g->workers <= 0) return NULL;
+    server *best = &g->slot[0];
+    int best_load = server_slot_load(best);
+    for (int i = 1; i < g->workers; i++) {
+        int load = server_slot_load(&g->slot[i]);
+        if (load < best_load) {
+            best = &g->slot[i];
+            best_load = load;
+        }
+    }
+    return best;
+}
 
 static void append_model_json_values(buf *b, int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
@@ -11095,24 +11168,31 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
-static void client_done(server *s) {
-    pthread_mutex_lock(&s->mu);
-    if (s->clients > 0) s->clients--;
-    pthread_cond_broadcast(&s->clients_cv);
-    pthread_mutex_unlock(&s->mu);
+static void client_done(server_group *g) {
+    pthread_mutex_lock(&g->mu);
+    if (g->clients > 0) g->clients--;
+    pthread_cond_broadcast(&g->clients_cv);
+    pthread_mutex_unlock(&g->mu);
 }
 
 static void set_client_socket_nonblocking(int fd);
 
 static void *client_main(void *arg) {
     client_arg *ca = arg;
-    server *s = ca->srv;
+    server_group *g = ca->group;
     int fd = ca->fd;
     free(ca);
 
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
+        goto done;
+    }
+
+    server *s = choose_worker_slot(g);
+    if (!s) {
+        http_error(fd, 503, "server unavailable");
+        http_request_free(&hr);
         goto done;
     }
 
@@ -11180,7 +11260,7 @@ static void *client_main(void *arg) {
     request_free(&j.req);
 done:
     close(fd);
-    client_done(s);
+    client_done(g);
     return NULL;
 }
 
@@ -11232,6 +11312,7 @@ typedef struct {
     const char *host;
     int port;
     int ctx_size;
+    int workers;
     int default_tokens;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -11292,11 +11373,8 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
                m.comp_cap);
 }
 
-static void server_close_resources(server *s) {
-    if (s->trace) {
-        fclose(s->trace);
-        s->trace = NULL;
-    }
+static void server_slot_close_resources(server *s) {
+    if (!s || !s->initialized) return;
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     live_tool_state_free(&s->responses_live);
@@ -11304,12 +11382,28 @@ static void server_close_resources(server *s) {
     visible_live_free(&s->thinking_live);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
-    pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
     ds4_session_free(s->session);
-    ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
+}
+
+static void server_group_close_resources(server_group *g) {
+    if (!g) return;
+    if (g->slot) {
+        for (int i = 0; i < g->workers; i++) server_slot_close_resources(&g->slot[i]);
+    }
+    free(g->slot);
+    free(g->worker);
+    if (g->trace) {
+        fclose(g->trace);
+        g->trace = NULL;
+    }
+    pthread_mutex_destroy(&g->trace_mu);
+    pthread_cond_destroy(&g->clients_cv);
+    pthread_mutex_destroy(&g->mu);
+    ds4_engine_close(g->engine);
+    memset(g, 0, sizeof(*g));
 }
 
 static void usage(FILE *fp) {
@@ -11331,6 +11425,8 @@ static void usage(FILE *fp) {
         "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
         "  -t, --threads N\n"
         "      CPU helper threads for lightweight host-side work.\n"
+        "  --workers N\n"
+        "      Number of independent server inference workers. Default: 1, maximum: 2\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
@@ -11430,6 +11526,7 @@ static server_config parse_options(int argc, char **argv) {
         .host = "127.0.0.1",
         .port = 8000,
         .ctx_size = 32768,
+        .workers = 1,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -11455,6 +11552,8 @@ static server_config parse_options(int argc, char **argv) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--workers")) {
+            c.workers = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
@@ -11514,6 +11613,10 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+    if (c.workers < 1 || c.workers > 2) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --workers must be between 1 and 2");
+        exit(2);
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -11537,58 +11640,99 @@ int main(int argc, char **argv) {
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
 
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
-                   ds4_backend_name(cfg.engine.backend));
-        ds4_engine_close(engine);
-        return 1;
-    }
+    server_group g;
+    memset(&g, 0, sizeof(g));
+    g.engine = engine;
+    g.workers = cfg.workers;
+    g.default_tokens = cfg.default_tokens;
+    g.ctx_size = cfg.ctx_size;
+    pthread_mutex_init(&g.mu, NULL);
+    pthread_cond_init(&g.clients_cv, NULL);
+    pthread_mutex_init(&g.trace_mu, NULL);
+    g.slot = xmalloc((size_t)cfg.workers * sizeof(g.slot[0]));
+    g.worker = xmalloc((size_t)cfg.workers * sizeof(g.worker[0]));
+    memset(g.slot, 0, (size_t)cfg.workers * sizeof(g.slot[0]));
+    memset(g.worker, 0, (size_t)cfg.workers * sizeof(g.worker[0]));
 
-    server s;
-    memset(&s, 0, sizeof(s));
-    s.engine = engine;
-    s.session = session;
-    s.default_tokens = cfg.default_tokens;
-    s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
-    s.tool_mem.max_entries = cfg.tool_memory_max_ids;
-    if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
-    }
-    if (s.disable_exact_dsml_tool_replay) {
+    if (cfg.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
     }
-    pthread_mutex_init(&s.mu, NULL);
-    pthread_cond_init(&s.cv, NULL);
-    pthread_cond_init(&s.clients_cv, NULL);
-    pthread_mutex_init(&s.tool_mu, NULL);
-    pthread_mutex_init(&s.trace_mu, NULL);
     if (cfg.trace_path) {
-        s.trace = fopen(cfg.trace_path, "w");
-        if (!s.trace) {
+        g.trace = fopen(cfg.trace_path, "w");
+        if (!g.trace) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
-            server_close_resources(&s);
+            server_group_close_resources(&g);
             return 1;
         }
-        setvbuf(s.trace, NULL, _IONBF, 0);
+        setvbuf(g.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
+    for (int i = 0; i < cfg.workers; i++) {
+        server *slot = &g.slot[i];
+        slot->group = &g;
+        slot->worker_id = i;
+        slot->engine = engine;
+        slot->default_tokens = cfg.default_tokens;
+        slot->disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+        slot->tool_mem.max_entries = cfg.tool_memory_max_ids;
+        slot->trace = g.trace;
+        pthread_mutex_init(&slot->mu, NULL);
+        pthread_cond_init(&slot->cv, NULL);
+        pthread_mutex_init(&slot->tool_mu, NULL);
+        pthread_mutex_init(&slot->trace_mu, NULL);
+        slot->initialized = true;
+        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session for worker %d",
+                       ds4_backend_name(cfg.engine.backend), i);
+            server_group_close_resources(&g);
+            return 1;
+        }
+        if (cfg.kv_disk_dir) {
+            if (cfg.workers == 1) {
+                kv_cache_open(&slot->kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                              cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+            } else {
+                char name[32];
+                snprintf(name, sizeof(name), "worker-%d", i);
+                char *dir = path_join(cfg.kv_disk_dir, name);
+                kv_cache_open(&slot->kv, dir, cfg.kv_disk_space_mb,
+                              cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+                free(dir);
+            }
+        }
+    }
+
+    for (int i = 0; i < cfg.workers; i++) {
+        if (pthread_create(&g.worker[i], NULL, worker_main, &g.slot[i]) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to start worker %d", i);
+            for (int j = 0; j < i; j++) {
+                pthread_mutex_lock(&g.slot[j].mu);
+                g.slot[j].stopping = true;
+                pthread_cond_broadcast(&g.slot[j].cv);
+                pthread_mutex_unlock(&g.slot[j].mu);
+                pthread_join(g.worker[j], NULL);
+            }
+            server_group_close_resources(&g);
+            return 1;
+        }
+    }
+    server_log(DS4_LOG_DEFAULT, "ds4-server: started %d inference worker%s",
+               cfg.workers, cfg.workers == 1 ? "" : "s");
 
     int lfd = listen_on(cfg.host, cfg.port);
     if (lfd < 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
-        pthread_mutex_lock(&s.mu);
-        s.stopping = true;
-        pthread_cond_broadcast(&s.cv);
-        pthread_mutex_unlock(&s.mu);
-        pthread_join(worker, NULL);
-        server_close_resources(&s);
+        for (int i = 0; i < g.workers; i++) {
+            pthread_mutex_lock(&g.slot[i].mu);
+            g.slot[i].stopping = true;
+            pthread_cond_broadcast(&g.slot[i].cv);
+            pthread_mutex_unlock(&g.slot[i].mu);
+            pthread_join(g.worker[i], NULL);
+        }
+        server_group_close_resources(&g);
         return 1;
     }
     g_listen_fd = lfd;
@@ -11609,17 +11753,17 @@ int main(int argc, char **argv) {
 
         configure_client_socket(fd);
         client_arg *ca = xmalloc(sizeof(*ca));
-        ca->srv = &s;
+        ca->group = &g;
         ca->fd = fd;
-        pthread_mutex_lock(&s.mu);
-        s.clients++;
-        pthread_mutex_unlock(&s.mu);
+        pthread_mutex_lock(&g.mu);
+        g.clients++;
+        pthread_mutex_unlock(&g.mu);
         pthread_t th;
         if (pthread_create(&th, NULL, client_main, ca) != 0) {
-            pthread_mutex_lock(&s.mu);
-            s.clients--;
-            pthread_cond_broadcast(&s.clients_cv);
-            pthread_mutex_unlock(&s.mu);
+            pthread_mutex_lock(&g.mu);
+            g.clients--;
+            pthread_cond_broadcast(&g.clients_cv);
+            pthread_mutex_unlock(&g.mu);
             free(ca);
             close(fd);
             continue;
@@ -11632,23 +11776,29 @@ int main(int argc, char **argv) {
     }
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
-    pthread_mutex_lock(&s.mu);
-    s.stopping = true;
-    pthread_cond_broadcast(&s.cv);
-    pthread_mutex_unlock(&s.mu);
-    pthread_join(worker, NULL);
-    pthread_mutex_lock(&s.mu);
-    while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
-    pthread_mutex_unlock(&s.mu);
-
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
-                   tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+    for (int i = 0; i < g.workers; i++) {
+        pthread_mutex_lock(&g.slot[i].mu);
+        g.slot[i].stopping = true;
+        pthread_cond_broadcast(&g.slot[i].cv);
+        pthread_mutex_unlock(&g.slot[i].mu);
     }
-    server_close_resources(&s);
+    for (int i = 0; i < g.workers; i++) pthread_join(g.worker[i], NULL);
+    pthread_mutex_lock(&g.mu);
+    while (g.clients > 0) pthread_cond_wait(&g.clients_cv, &g.mu);
+    pthread_mutex_unlock(&g.mu);
+
+    for (int i = 0; i < g.workers; i++) {
+        server *slot = &g.slot[i];
+        const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+        if (slot->kv.enabled && tokens && tokens->len >= slot->kv.opt.min_tokens) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: persisting worker %d KV cache before shutdown tokens=%d",
+                       slot->worker_id,
+                       tokens->len);
+            kv_cache_store_current(slot, "shutdown");
+        }
+    }
+    server_group_close_resources(&g);
     return 0;
 }
 #else
@@ -14144,6 +14294,27 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     rmdir(dir);
 }
 
+static void test_worker_slot_scheduler_prefers_lowest_load(void) {
+    server_group g = {0};
+    server slots[2];
+    memset(slots, 0, sizeof(slots));
+    g.slot = slots;
+    g.workers = 2;
+    for (int i = 0; i < 2; i++) pthread_mutex_init(&slots[i].mu, NULL);
+
+    slots[0].queued = 1;
+    slots[0].running = true;
+    slots[1].queued = 0;
+    slots[1].running = false;
+    TEST_ASSERT(choose_worker_slot(&g) == &slots[1]);
+
+    slots[1].queued = 3;
+    TEST_ASSERT(choose_worker_slot(&g) == &slots[0]);
+
+    pthread_mutex_destroy(&slots[0].mu);
+    pthread_mutex_destroy(&slots[1].mu);
+}
+
 static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     /* Simulate: user sends a single message, thinking mode on, no tools.
      * Model generates reasoning + content.  The next request will drop the
@@ -14479,6 +14650,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_worker_slot_scheduler_prefers_lowest_load();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -83,6 +84,7 @@ static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
+static pthread_mutex_t g_execution_mutex = PTHREAD_MUTEX_INITIALIZER;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -1409,10 +1411,21 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
-extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+extern "C" void ds4_gpu_execution_lock(void) { pthread_mutex_lock(&g_execution_mutex); }
+extern "C" void ds4_gpu_execution_unlock(void) { pthread_mutex_unlock(&g_execution_mutex); }
+extern "C" int ds4_gpu_begin_commands(void) { ds4_gpu_execution_lock(); return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
-extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+extern "C" int ds4_gpu_end_commands(void) {
+    int ok = cuda_ok(cudaDeviceSynchronize(), "end commands");
+    ds4_gpu_execution_unlock();
+    return ok;
+}
+extern "C" int ds4_gpu_synchronize(void) {
+    ds4_gpu_execution_lock();
+    int ok = cuda_ok(cudaDeviceSynchronize(), "synchronize");
+    ds4_gpu_execution_unlock();
+    return ok;
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
