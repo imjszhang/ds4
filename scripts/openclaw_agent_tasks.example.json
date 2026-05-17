@@ -1,0 +1,52 @@
+[
+  {
+    "id": "short-zh-stack-queue",
+    "prompt": "用不超过20个汉字解释：栈和队列的区别。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["栈", "队列"]
+    }
+  },
+  {
+    "id": "digit-two-chars-only",
+    "prompt": "只输出两位数阿拉伯数字作答，不要有其它任何字符（不要空格标点换行）。19+35=?",
+    "repeat": 2,
+    "expect": {
+      "exit_zero": true,
+      "output_regex": "^54$",
+      "max_wall_s": 120
+    }
+  },
+  {
+    "id": "nonempty-reply",
+    "prompt": "用一句话回答：1+1等于几？",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "min_output_chars": 1,
+      "max_wall_s": 120
+    }
+  },
+  {
+    "id": "thinking-off-smoke",
+    "prompt": "只回复一个字：好",
+    "thinking": "off",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["好"],
+      "max_wall_s": 180
+    }
+  },
+  {
+    "id": "multiline-greeting",
+    "prompt": "严格按两行输出：第一行只写「甲」，第二行只写「乙」。不要其它内容。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["甲", "乙"],
+      "max_wall_s": 180
+    }
+  }
+]

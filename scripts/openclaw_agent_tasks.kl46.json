@@ -1,0 +1,122 @@
+[
+  {
+    "id": "L1-lobster-local-first-contact",
+    "tier": "L1",
+    "prompt": "你是通过 OpenClaw 接入的助手。请用两三句话说明：你是否可能在「本地」推理模型上运行，以及你判断依据是什么（不要编造不存在的系统信息）。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "min_output_chars": 20
+    }
+  },
+  {
+    "id": "L1-zh-after-heavy-quant",
+    "tier": "L1",
+    "prompt": "284B 级别模型若被激进量化，中文能力常见退化表现有哪些？请列两条，每条不超过30字，用中文回答。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "min_output_chars": 15,
+      "output_regex": "[\\u4e00-\\u9fff]"
+    }
+  },
+  {
+    "id": "L1-latency-user-perception",
+    "tier": "L1",
+    "prompt": "从用户体感角度，用不超过100字中文说明：一次问答延迟通常由哪些主要环节构成（例如网关、排队、首 token、生成等），不要编造精确毫秒。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "min_output_chars": 30
+    }
+  },
+  {
+    "id": "L2-plan-complex-article",
+    "tier": "L2",
+    "prompt": "我要写一篇技术介绍文章并配图与排版。请你把这件事拆成清晰的子步骤（至少5步），用编号列表输出，每步一行，步骤名尽量短。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["1", "2", "3", "4", "5"],
+      "min_output_chars": 40
+    }
+  },
+  {
+    "id": "L2-tool-weather-path",
+    "tier": "L2",
+    "prompt": "若我让你查「今天上海的气温」，你会如何做？请用一段话说明：是否会使用联网/工具、需要我提供什么前提（例如城市与日期）、以及无法联网时你会怎么答复。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["天气", "联网"]
+    }
+  },
+  {
+    "id": "L2-longcontext-ds4-motivations",
+    "tier": "L2",
+    "prompt": "以下是开源项目 DwarfStar4（DS4）README 中「Motivations」一节的英文摘录（请只基于本段作答，不要凭空编造未出现的信息）：\n\nNow, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special model deserving a stand alone engine? Because after comparing it with powerful smaller dense models, we can report that:\n\n1. DeepSeek v4 Flash is faster because of less active parameters.\n2. In thinking mode, if you avoid max thinking, it produces a thinking section that is a lot shorter than other models, even 1/5 of other models in many cases, and crucially, the thinking section length is proportional to the problem complexity. This makes DeepSeek v4 Flash usable with thinking enabled when other models are practically impossible to use in the same conditions.\n3. The model features a context window of 1 million tokens.\n4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.\n5. It writes much better English and Italian. It feels a quasi-frontier model.\n6. The KV cache is incredibly compressed, allowing long context inference on local computers and on disk KV cache persistence.\n7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).\n8. We expect DeepSeek to release updated versions of v4 Flash in the future, even better than the current one.\n\n问题（用中文，三到五句话）：上文中编号第3条与第6条分别讲了什么？请用简短中文概括，并各提到「百万」或「KV」其中之一关键词。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["百万", "KV"]
+    }
+  },
+  {
+    "id": "L2-multi-turn-remember-KL46",
+    "tier": "L2",
+    "turns": [
+      {
+        "prompt": "本测评中我的固定项目代号是 KL46（大写 K、L、数字 4、6）。后面会问到你，请确立记忆。现在只回复：收到。"
+      },
+      {
+        "prompt": "只输出我刚才让你记住的项目代号本身，不要空格、标点或其它字。"
+      }
+    ],
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "all_turns_exit_zero": true,
+      "output_contains": ["KL46"]
+    }
+  },
+  {
+    "id": "L3-code-python-snippet",
+    "tier": "L3",
+    "prompt": "请写一段最小可运行的 Python3 代码：定义函数 hello() 打印一行 Hello。给出代码即可，可包在 markdown 代码块里。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["def", "Hello"]
+    }
+  },
+  {
+    "id": "L3-reasoning-chicken-rabbit",
+    "tier": "L3",
+    "prompt": "鸡兔同笼：共 8 个头、22 条腿，鸡兔各几只？只回答一句：鸡几只兔几只（使用阿拉伯数字，例如：鸡5兔3）。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["鸡", "兔", "5", "3"]
+    }
+  },
+  {
+    "id": "L3-knowledge-capital",
+    "tier": "L3",
+    "prompt": "法国的首都是哪座城市？只输出标准中文城市名三个字，不要其它字符。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "output_contains": ["巴黎"]
+    }
+  },
+  {
+    "id": "L3-concurrency-local-queue",
+    "tier": "L3",
+    "prompt": "在本地单机单卡（或单推理进程）服务多个并发用户会话时，请求通常会怎样被调度或排队？用不超过120字中文说明，不要绝对化承诺。",
+    "repeat": 1,
+    "expect": {
+      "exit_zero": true,
+      "min_output_chars": 25
+    }
+  }
+]
