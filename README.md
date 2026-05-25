@@ -1,6 +1,6 @@
-# DwarfStar 4
+# DwarfStar
 
-DwarfStar 4 is a small native inference engine optimized first for
+**DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
 machines. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
@@ -225,7 +225,7 @@ for example:
 
 ## Native agent
 
-DwarfStar 4 features a native coding agent that works in a different way
+DwarfStar features a native coding agent that works in a different way
 than most other systems: the inference is controlled from within the agent
 itself, without socket/API boundaries, so the session is represented
 by the on-disk KV cache itself. Moreover the tools and the system prompt
